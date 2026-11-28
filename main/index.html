@@ -557,6 +557,10 @@
   #txPtt { touch-action: none; user-select: none; -webkit-touch-callout: none; }
   #txMicLevel { width: 6rem; vertical-align: middle; }
   .scope-mute-btn { margin-right: .2rem; }
+  .hn-btn { margin-right: .2rem; }
+  .hn-btn.active { background: #065f46; color: #fff; border-color: #10b981; }
+  .hn-btn.loading { border-color: #f59e0b; color: #fbbf24; }
+  .hn-btn.error { border-color: #ef4444; color: #fca5a5; }
   .scope-vol { width: 56px; height: 10px; margin-right: .4rem; accent-color: #38bdf8; }
   .ft8-dtcorr { width: 4.4em; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 3px; font: inherit; font-size: .65rem; }
   .scope-mute-btn.muted {
@@ -1392,6 +1396,7 @@
             <div class="scope-spans" data-scope="Main">
               <button type="button" class="scope-span-btn scope-rec-btn" id="btnRecMain" title="Save the last 30 s of MAIN as WAV">REC</button>
               <button type="button" class="scope-span-btn scope-mute-btn" id="btnMuteMain" aria-pressed="false" title="Mute MAIN audio (scope and FT8 keep running)">MUTE</button>
+              <button type="button" class="scope-span-btn hn-btn" id="btnHnMain" aria-pressed="false" title="AI noise reduction (HamNoise) on the MAIN audio this PC plays. The radio, the scope and the decoders are not affected. Model and strength: DSP panel">AI NR</button>
               <input type="range" class="scope-vol" id="volMain" min="0" max="400" step="5" value="100" title="MAIN volume on this PC (the radio, the scope and FT8 are not affected)" aria-label="MAIN volume on this PC">
               <span class="scope-span-label">SPAN:</span>
               <button type="button" class="scope-span-btn" data-span="1000" title="Narrow span for CW">1k</button>
@@ -1422,6 +1427,7 @@
             <div class="scope-spans" data-scope="Sub">
               <button type="button" class="scope-span-btn scope-rec-btn" id="btnRecSub" title="Save the last 30 s of SUB as WAV">REC</button>
               <button type="button" class="scope-span-btn scope-mute-btn" id="btnMuteSub" aria-pressed="false" title="Mute SUB audio (scope and FT8 keep running)">MUTE</button>
+              <button type="button" class="scope-span-btn hn-btn" id="btnHnSub" aria-pressed="false" title="AI noise reduction (HamNoise) on the SUB audio this PC plays. The radio, the scope and the decoders are not affected. Model and strength: DSP panel">AI NR</button>
               <input type="range" class="scope-vol" id="volSub" min="0" max="400" step="5" value="100" title="SUB volume on this PC (the radio, the scope and FT8 are not affected)" aria-label="SUB volume on this PC">
               <span class="scope-span-label">SPAN:</span>
               <button type="button" class="scope-span-btn" data-span="1000" title="Narrow span for CW">1k</button>
@@ -1793,6 +1799,21 @@
         <div class="audio-meter" id="meterSub"><div class="lvl"></div><div class="thr"></div></div>
         <div class="sq-status" id="stateSub">SUB: --</div>
       </div>
+    </div>
+    <div class="sq-box hn-box" style="margin-top:8px;">
+      <strong>AI NOISE REDUCTION (HamNoise, this PC only)</strong>
+      <div class="sq-row">
+        <span>Model:</span>
+        <select id="hnModel" title="AUTO: CW model in CW, voice model in the other modes">
+          <option value="auto">AUTO (by mode)</option><option value="cw">CW</option><option value="voice">VOICE</option>
+        </select>
+      </div>
+      <div class="sq-row">
+        <span>Strength:</span>
+        <input type="range" id="hnStrength" min="0" max="100" step="5" value="100" title="How much of the cleaned audio is heard (the rest is the original)">
+        <span id="hnStrengthVal" style="font-family:monospace; min-width:40px;">100 %</span>
+      </div>
+      <div class="sq-status" id="hnStatus">Off. Turn it on with AI NR next to MUTE.</div>
     </div>
     <div class="sq-row" style="margin-top:8px;">
       <label><input type="checkbox" id="sqBusyBypass"> Suspend the DSP squelch while CAT reports BUSY (rig squelch open) (MAIN/SUB)</label>
@@ -2949,6 +2970,8 @@ async function start() {
       return g;
     });
     speakerGains.forEach((_, i) => applySpeakerMute(i));
+    hnBus = { ctx, splitter, ch };
+    hnRebuild();
     scopeAnalysers = [0, 1].map((i) => {
       const an = ctx.createAnalyser();
       an.fftSize = 4096;   // ~11.7 Hz per bin at 48 kHz: enough detail for the 1k (CW) span
@@ -3092,6 +3115,8 @@ function stop() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (abort) { abort.abort(); abort = null; }
   if (ctx) { ctx.close(); ctx = null; scopeAnalysers = [null, null]; speakerGains = [null, null]; }
+  hnBus = null;
+  hnRebuild();
   playLead = null;
   mediaSessionUpdate(false);
   btnPlay.textContent = 'POWER / PLAY';
@@ -5195,6 +5220,7 @@ async function smPoll() {
     document.getElementById('catConsoleForm').hidden = d.cat_console !== true;   // serial menu, k
     accLevelApply(d);
     txPowerApply(d);
+    hnApplyCat(d);
     catTxVfo = d.connected ? (d.tx_vfo || null) : null;
     const prevRxVfo = catRxVfo;
     catRxVfo = d.connected ? (d.rx_vfo || null) : null;
@@ -6162,6 +6188,224 @@ decSels.forEach((sel, idx) => sel.addEventListener('change', () => {
 
 decReady = true;
 decRefresh();
+
+// ============================================================================
+// AI noise reduction: HamNoise by e04 (https://github.com/e04/HamNoise, MIT License, see NOTICE) on the
+// audio this page plays. Each receiver channel can pass an AudioWorklet (see <script id="hn-worklet-src">)
+// between the channel split and its speaker gain; the scope analysers and the decoders tap the audio
+// before it, so they always get the original. The WebAssembly (CW 1.6 MB, voice 4.3 MB) is too large for
+// the firmware: it is downloaded from jsDelivr at a fixed commit, checked against its SHA-256 and kept in
+// the browser's cache. Receive only: nothing here talks to the radio.
+// ============================================================================
+const HN_COMMIT = '67ba309e4fef7e1438bce1a6de246d5907bed4c8';
+const HN_ASSETS = {
+  cw:    { path: '/gh/e04/HamNoise@' + HN_COMMIT + '/web/public/denoise-cw.wasm',
+           sha: '7e39fbba322dc9aa88135cf4eb1b27dc2f278997e1ef7a734d2159ae9435535b', mb: 1.7 },
+  voice: { path: '/gh/e04/HamNoise@' + HN_COMMIT + '/web/public/denoise-voice.wasm',
+           sha: 'd032f7cf2c36df685a253772eb4ea50c6a19d0e9b54e27c409a72aa0d9dacd97', mb: 4.3 },
+};
+const HN_MODEL_ID = { cw: 0, voice: 2 };   // HamNoise's own choices: CW, Voice (v2)
+const HN_CACHE = 'hamnoise-v1';
+const HN_PREFS_KEY = 'ftx1.hn';
+const HN_OUTPUT_LATENCY_MS = 45;   // the worklet's output cushion (HamNoise default 90 ms)
+let HN_CDN = 'https://cdn.jsdelivr.net';
+const hnSettings = { on: [false, false], model: 'auto', strength: 100 };
+try {
+  const saved = JSON.parse(localStorage.getItem(HN_PREFS_KEY) || '{}');
+  if (Array.isArray(saved.on)) hnSettings.on = [saved.on[0] === true, saved.on[1] === true];
+  if (['auto', 'cw', 'voice'].includes(saved.model)) hnSettings.model = saved.model;
+  if (saved.strength >= 0 && saved.strength <= 100) hnSettings.strength = Math.round(saved.strength / 5) * 5;
+} catch (e) {}
+let hnBus = null;                      // { ctx, splitter, ch } while audio plays
+const hnChan = [0, 1].map(() => ({ node: null, target: null, gen: 0, state: 'off', error: '' }));
+const hnBytes = {};                    // target -> Promise<ArrayBuffer> (checked)
+const hnModuleCtx = new WeakMap();     // AudioContext -> Promise (worklet module added)
+let hnMode = ['', ''];                 // the receivers' modes from /cat (FTDX10: the active VFO's)
+
+function hnSave() {
+  try { localStorage.setItem(HN_PREFS_KEY, JSON.stringify(hnSettings)); } catch (e) {}
+}
+
+async function hnSha256(buf) {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+  return Array.from(h, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function hnFetch(target) {
+  if (hnBytes[target]) return hnBytes[target];
+  const a = HN_ASSETS[target], url = HN_CDN + a.path;
+  hnBytes[target] = (async () => {
+    let cache = null;
+    try { cache = await caches.open(HN_CACHE); } catch (e) { /* no Cache Storage: download every time */ }
+    if (cache) {
+      try {
+        const hit = await cache.match(url);
+        if (hit) {
+          const buf = await hit.arrayBuffer();
+          if (await hnSha256(buf) === a.sha) return buf;
+          await cache.delete(url);
+        }
+      } catch (e) { /* fall back to the network */ }
+    }
+    const r = await fetch(url, { mode: 'cors', credentials: 'omit' });
+    if (!r.ok) throw new Error('download failed (' + r.status + ')');
+    const buf = await r.arrayBuffer();
+    if (await hnSha256(buf) !== a.sha) throw new Error(target + ' model: checksum mismatch, file refused');
+    if (cache) {
+      try { await cache.put(url, new Response(buf.slice(0), { headers: { 'Content-Type': 'application/wasm' } })); }
+      catch (e) { /* cache full: still usable now */ }
+    }
+    return buf;
+  })();
+  hnBytes[target].catch(() => { delete hnBytes[target]; });
+  return hnBytes[target];
+}
+
+function hnModule(c) {
+  if (!hnModuleCtx.has(c)) {
+    const src = document.getElementById('hn-worklet-src').textContent;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    const p = c.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+    hnModuleCtx.set(c, p);
+  }
+  return hnModuleCtx.get(c);
+}
+
+// CW model in CW, the voice model in every other mode (unless chosen by hand)
+function hnTargetFor(i) {
+  if (hnSettings.model !== 'auto') return hnSettings.model;
+  return /^CW/.test(hnMode[i] || '') ? 'cw' : 'voice';
+}
+
+function hnParams(chan) {
+  chan.node?.port.postMessage({ type: 'params', enabled: true, wet: hnSettings.strength / 100, gain: 1,
+                                modelId: HN_MODEL_ID[chan.target], outputLatencyMs: HN_OUTPUT_LATENCY_MS });
+}
+
+// Put channel i's audio through the denoiser or straight to its speaker gain, as the settings say.
+// The original keeps playing until the denoiser has loaded its model, then the paths are swapped.
+async function hnRoute(i) {
+  const chan = hnChan[i], gen = ++chan.gen, bus = hnBus;
+  const want = !!(bus && speakerGains[i] && hnSettings.on[i]);
+  const target = want ? hnTargetFor(i) : null;
+  const out = bus && bus.ch >= 2 ? i : 0;
+  const detach = (node, from) => {
+    if (!node) return;
+    node.port.onmessage = null;
+    try { node.disconnect(); } catch (e) {}
+    try { from.splitter.disconnect(node); } catch (e) {}
+  };
+  const straight = () => {
+    if (!bus || !speakerGains[i]) return;
+    try { bus.splitter.disconnect(speakerGains[i], out); } catch (e) {}
+    bus.splitter.connect(speakerGains[i], out);
+  };
+  if (!want) {
+    detach(chan.node, chan.bus); chan.node = null; straight();
+    chan.target = null; chan.state = 'off'; chan.failed = null;
+    hnShow();
+    return;
+  }
+  if (chan.node && chan.target === target && chan.bus === bus) { hnParams(chan); hnShow(); return; }
+  if (chan.failed === target + '|' + (bus && bus.ctx.sampleRate)) { hnShow(); return; }   // no retry loop
+  if (!chan.node) straight();
+  chan.state = 'loading'; chan.error = ''; hnShow();
+  try {
+    const [bytes] = await Promise.all([hnFetch(target), hnModule(bus.ctx)]);
+    if (gen !== chan.gen || bus !== hnBus) return;   // turned off, model or stream changed meanwhile
+    const node = new AudioWorkletNode(bus.ctx, 'hamnoise-denoise', {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+      processorOptions: { wasmBytes: bytes, modelId: HN_MODEL_ID[target], outputLatencyMs: HN_OUTPUT_LATENCY_MS },
+    });
+    bus.splitter.connect(node, out);
+    node.port.onmessage = (e) => {
+      if (e.data.type === 'ready') {
+        if (gen !== chan.gen || bus !== hnBus) { detach(node, bus); return; }
+        const old = chan.node;
+        chan.node = node; chan.target = target; chan.bus = bus; chan.state = 'on'; chan.failed = null; chan.load = NaN;
+        node.connect(speakerGains[i]);
+        try { bus.splitter.disconnect(speakerGains[i], out); } catch (err) {}
+        if (old && old !== node) detach(old, bus);
+        hnParams(chan);
+      } else if (e.data.type === 'load') {
+        if (chan.node === node) chan.load = e.data.pct;
+      } else if (e.data.type === 'error') {
+        const wasLive = chan.node === node;
+        detach(node, bus);
+        if (wasLive) { chan.node = null; straight(); }
+        chan.state = 'error'; chan.error = e.data.message; chan.failed = target + '|' + bus.ctx.sampleRate;
+        console.warn('AI NR:', chan.error);
+      }
+      hnShow();
+    };
+  } catch (e) {
+    if (gen !== chan.gen) return;
+    chan.state = 'error'; chan.error = String(e && e.message || e);
+    console.warn('AI NR:', chan.error);
+    hnShow();
+  }
+}
+
+function hnRebuild() {
+  // The old context's nodes are gone with it
+  hnChan.forEach((chan) => { chan.node = null; chan.target = null; chan.bus = null; chan.failed = null; });
+  [0, 1].forEach(hnRoute);
+}
+
+function hnApplyCat(d) {
+  const single = d.dual_rx === false;
+  const modes = [single && d.rx_vfo === 'sub' ? d.mode_sub : d.mode_main, single ? '' : d.mode_sub];
+  const before = [hnTargetFor(0), hnTargetFor(1)];
+  hnMode = modes.map((m) => m || '');
+  [0, 1].forEach((i) => { if (hnSettings.on[i] && hnTargetFor(i) !== before[i]) hnRoute(i); });
+}
+
+const hnBtns = ['Main', 'Sub'].map((S) => document.getElementById('btnHn' + S));
+const hnStatusEl = document.getElementById('hnStatus');
+const hnModelSel = document.getElementById('hnModel');
+const hnStrength = document.getElementById('hnStrength');
+const hnStrengthVal = document.getElementById('hnStrengthVal');
+
+function hnShow() {
+  const names = ['MAIN', 'SUB'];
+  hnBtns.forEach((btn, i) => {
+    const c = hnChan[i], on = hnSettings.on[i];
+    btn.classList.toggle('active', on && c.state === 'on');
+    btn.classList.toggle('loading', on && c.state === 'loading');
+    btn.classList.toggle('error', on && c.state === 'error');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  const parts = [0, 1].filter((i) => hnSettings.on[i]).map((i) => {
+    const c = hnChan[i], t = hnTargetFor(i);
+    if (!hnBus) return names[i] + ': on, starts with the audio';
+    if (c.state === 'loading') return names[i] + ': loading the ' + t + ' model (' + HN_ASSETS[t].mb + ' MB, first time only)…';
+    if (c.state === 'error') return names[i] + ': ERROR ' + c.error + ' (downloaded from cdn.jsdelivr.net), original audio';
+    return names[i] + ': ' + (c.target || t).toUpperCase() + ' model' +
+           (Number.isFinite(c.load) ? ', CPU ' + c.load + ' %' + (c.load > 70 ? ' (too heavy for this device: turn it off)' : '') : '');
+  });
+  hnStatusEl.textContent = parts.length ? parts.join(' · ') : 'Off. Turn it on with AI NR next to MUTE.';
+  hnModelSel.value = hnSettings.model;
+  hnStrength.value = hnSettings.strength;
+  hnStrengthVal.textContent = hnSettings.strength + ' %';
+}
+
+hnBtns.forEach((btn, i) => btn.addEventListener('click', () => {
+  hnSettings.on[i] = !hnSettings.on[i];
+  hnSave();
+  hnRoute(i);
+}));
+hnModelSel.addEventListener('change', () => {
+  hnSettings.model = ['auto', 'cw', 'voice'].includes(hnModelSel.value) ? hnModelSel.value : 'auto';
+  hnSave();
+  [0, 1].forEach(hnRoute);
+});
+hnStrength.addEventListener('input', () => {
+  hnSettings.strength = Number(hnStrength.value);
+  hnSave();
+  hnChan.forEach(hnParams);
+  hnShow();
+});
+hnShow();
 </script>
 <script type="text/plain" id="ft8-worker-src">
 // ---- FT8 decoder: runs in a Web Worker so that the 1-2 s of heavy computation per slot does not
@@ -6880,6 +7124,514 @@ if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
     self.postMessage({ idx: job.idx, utc: job.utc, dialHz: job.dialHz, ms: Date.now() - t0, results });
   };
 }
+</script>
+<script type="text/plain" id="hn-worklet-src">
+// ---- AI noise reduction: HamNoise's AudioWorklet, from e04/HamNoise web/public/denoise-worklet.js
+// (https://github.com/e04/HamNoise at commit 67ba309e4fef7e1438bce1a6de246d5907bed4c8), MIT License,
+// Copyright (c) 2026 e04. See NOTICE. Changes here: the processor name, no scope / meter buffers (this
+// page does not draw them), a CPU load report, and the resampler's filter weights are computed once per fractional position
+// (the stream rates are rational multiples of 9600 Hz, so a few positions repeat) instead of per sample.
+const hnClock = globalThis.performance && typeof globalThis.performance.now === 'function'
+  ? () => globalThis.performance.now() : () => Date.now();
+const DOWNSAMPLE_FILTER_RADIUS = 128;
+const UPSAMPLE_FILTER_RADIUS = 16;
+const RENDER_QUANTUM_SAMPLES = 128;
+const DEFAULT_OUTPUT_LATENCY_MS = 90;
+const MIN_OUTPUT_LATENCY_MS = 15;
+const MAX_OUTPUT_LATENCY_MS = 120;
+const OUTPUT_RAMP_SECONDS = 0.03;
+const MODEL_FADE_SECONDS = 0.08;
+
+class Fifo {
+  constructor(capacity) {
+    this.values = new Float32Array(capacity);
+    this.capacity = capacity;
+    this.readIndex = 0;
+    this.writeIndex = 0;
+    this.lengthValue = 0;
+  }
+
+  push(value) {
+    if (this.lengthValue >= this.capacity) {
+      this.readIndex = (this.readIndex + 1) % this.capacity;
+      this.lengthValue -= 1;
+    }
+    this.values[this.writeIndex] = Number.isFinite(value) ? value : 0;
+    this.writeIndex = (this.writeIndex + 1) % this.capacity;
+    this.lengthValue += 1;
+  }
+
+  shift() {
+    if (this.lengthValue <= 0) return 0;
+    const value = this.values[this.readIndex];
+    this.readIndex = (this.readIndex + 1) % this.capacity;
+    this.lengthValue -= 1;
+    return value;
+  }
+
+  get length() {
+    return this.lengthValue;
+  }
+
+  clear() {
+    this.readIndex = 0;
+    this.writeIndex = 0;
+    this.lengthValue = 0;
+  }
+}
+
+class ScopeBuffer {
+  constructor(capacity) {
+    this.values = new Float32Array(capacity);
+    this.capacity = capacity;
+    this.writeIndex = 0;
+    this.lengthValue = 0;
+  }
+
+  push(value) {
+    this.values[this.writeIndex] = Number.isFinite(value) ? value : 0;
+    this.writeIndex = (this.writeIndex + 1) % this.capacity;
+    if (this.lengthValue < this.capacity) this.lengthValue += 1;
+  }
+
+  drain() {
+    const output = new Float32Array(this.lengthValue);
+    const start = (this.writeIndex - this.lengthValue + this.capacity) % this.capacity;
+    const firstCount = Math.min(this.lengthValue, this.capacity - start);
+    output.set(this.values.subarray(start, start + firstCount), 0);
+    if (firstCount < this.lengthValue) {
+      output.set(this.values.subarray(0, this.lengthValue - firstCount), firstCount);
+    }
+    this.clear();
+    return output;
+  }
+
+  clear() {
+    this.writeIndex = 0;
+    this.lengthValue = 0;
+  }
+}
+
+class SincResampler {
+  constructor(fromRate, toRate, onSample, radius) {
+    this.fromRate = fromRate;
+    this.toRate = toRate;
+    this.onSample = onSample;
+    this.radius = radius;
+    this.step = fromRate / toRate;
+    this.position = 0;
+    this.baseIndex = -radius;
+    this.buffer = new Array(radius).fill(0);
+    this.cutoff = Math.min(fromRate, toRate) * 0.475;
+    this.cutoffNorm = this.cutoff / fromRate;
+    this.weights = new Map();   // fractional position (in millionths) -> weights
+  }
+
+  process(input) {
+    for (let i = 0; i < input.length; i += 1) this.buffer.push(input[i]);
+
+    const lastIndex = this.baseIndex + this.buffer.length - 1;
+    while (this.position + this.radius <= lastIndex) {
+      this.onSample(this.sampleAt(this.position));
+      this.position += this.step;
+    }
+
+    const keepFrom = Math.floor(this.position) - this.radius - 1;
+    const drop = Math.max(0, keepFrom - this.baseIndex);
+    if (drop > 0) {
+      this.buffer.splice(0, drop);
+      this.baseIndex += drop;
+    }
+  }
+
+  sampleAt(position) {
+    const center = Math.floor(position);
+    const frac = position - center;
+    const key = Math.round(frac * 1e6);
+    let w = this.weights.get(key);
+    if (!w) {
+      // The same weights as the original per-sample loop, for this fractional position
+      w = new Float64Array(2 * this.radius + 1);
+      let weightSum = 0;
+      for (let k = -this.radius; k <= this.radius; k += 1) {
+        const distance = frac - k;
+        const absDistance = Math.abs(distance);
+        if (absDistance > this.radius) continue;
+        const sincArg = 2 * this.cutoffNorm * distance;
+        const sinc = Math.abs(sincArg) < 1e-8
+          ? 1
+          : Math.sin(Math.PI * sincArg) / (Math.PI * sincArg);
+        const x = absDistance / this.radius;
+        const window = 0.42 + (0.5 * Math.cos(Math.PI * x)) + (0.08 * Math.cos(2 * Math.PI * x));
+        const weight = 2 * this.cutoffNorm * sinc * window;
+        w[k + this.radius] = weight;
+        weightSum += weight;
+      }
+      w.sum = weightSum;
+      if (this.weights.size < 256) this.weights.set(key, w);
+    }
+    let acc = 0;
+    const base = center - this.radius - this.baseIndex;
+    for (let k = 0; k < w.length; k += 1) {
+      const sample = this.buffer[base + k] ?? 0;
+      acc += sample * w[k];
+    }
+    return Math.abs(w.sum) > 1e-8 ? acc / w.sum : 0;
+  }
+
+  reset() {
+    this.position = 0;
+    this.baseIndex = -this.radius;
+    this.buffer = new Array(this.radius).fill(0);
+  }
+}
+
+class DenoiseWorklet extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.enabled = true;
+    this.wet = 1;
+    this.gain = 1;
+    const initialModelId = Number(options?.processorOptions?.modelId);
+    this.modelId = Number.isInteger(initialModelId) ? initialModelId : 0;
+    const initialOutputLatencyMs = Number(options?.processorOptions?.outputLatencyMs);
+    this.outputLatencyMs = this.clampOutputLatencyMs(initialOutputLatencyMs);
+    this.ready = false;
+    this.error = null;
+    this.denoiseRate = 9600;
+    this.hopLength = 144;
+    this.inputBins = 129;
+    this.hopFill = 0;
+    this.inputRms = 0;
+    this.outputRms = 0;
+    this.gains = new Float32Array(this.inputBins);
+    this.inputHop = null;
+    this.outputHop = null;
+    this.gainsView = null;
+    this.resampleInput = new Float32Array(this.hopLength);
+    this.outputQueue = new Fifo(Math.max(16384, Math.ceil(sampleRate * 2)));
+    this.scopeOutputQueue = new Fifo(Math.max(16384, Math.ceil(sampleRate * 2)));
+    this.dryDelayQueue = new Fifo(16384);
+    this.dryDelaySamples = 0;
+    this.downsampler = new SincResampler(
+      sampleRate,
+      this.denoiseRate,
+      (sample) => this.acceptDenoiseSample(sample),
+      DOWNSAMPLE_FILTER_RADIUS
+    );
+    this.upsampler = new SincResampler(
+      this.denoiseRate,
+      sampleRate,
+      (sample) => this.outputQueue.push(sample),
+      UPSAMPLE_FILTER_RADIUS
+    );
+    this.scopeUpsampler = new SincResampler(
+      this.denoiseRate,
+      sampleRate,
+      (sample) => this.scopeOutputQueue.push(sample),
+      UPSAMPLE_FILTER_RADIUS
+    );
+    this.outputPrimed = false;
+    this.outputLatencySamples = this.calculateOutputLatencySamples();
+    this.outputRampSamples = this.calculateOutputRampSamples();
+    this.outputRampRemaining = 0;
+    this.modelFadeSamples = this.calculateModelFadeSamples();
+    this.modelFadeRemaining = this.modelFadeSamples;
+    this.lastOutputSample = 0;
+    this.maxScopeSamples = Math.max(4096, Math.ceil(sampleRate * 0.25));
+    this.scopeInput = new ScopeBuffer(this.maxScopeSamples);
+    this.scopeOutput = new ScopeBuffer(this.maxScopeSamples);
+    this.wasmBytes = options?.processorOptions?.wasmBytes ?? null;
+
+    this.port.onmessage = (event) => this.handleMessage(event.data);
+    this.loadWasm();
+  }
+
+  async loadWasm() {
+    try {
+      if (!this.wasmBytes) {
+        throw new Error("denoise wasm bytes were not provided");
+      }
+      const result = await WebAssembly.instantiate(this.wasmBytes, {
+        env: {
+          memory: new WebAssembly.Memory({ initial: 256 }),
+          emscripten_notify_memory_growth: () => {},
+        },
+        wasi_snapshot_preview1: {
+          proc_exit: () => {},
+        },
+      });
+
+      this.exports = result.instance.exports;
+      const status = this.exports.denoise_web_init();
+      if (status !== 0) throw new Error(`denoise init failed: ${status}`);
+      if (typeof this.exports.denoise_web_set_model === "function") {
+        const modelStatus = this.exports.denoise_web_set_model(this.modelId);
+        if (modelStatus !== 0) throw new Error(`model select failed: ${modelStatus}`);
+      }
+
+      this.denoiseRate = this.exports.denoise_web_sample_rate();
+      this.refreshWasmViews();
+      this.downsampler = new SincResampler(
+        sampleRate,
+        this.denoiseRate,
+        (sample) => this.acceptDenoiseSample(sample),
+        DOWNSAMPLE_FILTER_RADIUS
+      );
+      this.upsampler = new SincResampler(
+        this.denoiseRate,
+        sampleRate,
+        (sample) => this.outputQueue.push(sample),
+        UPSAMPLE_FILTER_RADIUS
+      );
+      this.scopeUpsampler = new SincResampler(
+        this.denoiseRate,
+        sampleRate,
+        (sample) => this.scopeOutputQueue.push(sample),
+        UPSAMPLE_FILTER_RADIUS
+      );
+      this.outputQueue.clear();
+      this.scopeOutputQueue.clear();
+      this.resetDryDelay();
+      this.outputPrimed = false;
+      this.outputLatencySamples = this.calculateOutputLatencySamples();
+      this.outputRampSamples = this.calculateOutputRampSamples();
+      this.outputRampRemaining = 0;
+      this.modelFadeSamples = this.calculateModelFadeSamples();
+      this.modelFadeRemaining = this.modelFadeSamples;
+      this.lastOutputSample = 0;
+      this.ready = true;
+      this.port.postMessage({ type: "ready" });
+    } catch (error) {
+      this.error = error;
+      this.port.postMessage({ type: "error", message: error.message || String(error) });
+    }
+  }
+
+  handleMessage(data) {
+    if (data.type === "params") {
+      this.enabled = Boolean(data.enabled);
+      this.wet = Math.max(0, Math.min(1, Number(data.wet)));
+      this.gain = Math.max(0, Math.min(2, Number(data.gain)));
+      this.setOutputLatencyMs(data.outputLatencyMs);
+      const nextModelId = Number(data.modelId);
+      if (Number.isInteger(nextModelId) && nextModelId !== this.modelId) {
+        this.modelId = nextModelId;
+        if (this.ready && typeof this.exports?.denoise_web_set_model === "function") {
+          const status = this.exports.denoise_web_set_model(this.modelId);
+          if (status !== 0) {
+            this.port.postMessage({ type: "error", message: `model select failed: ${status}` });
+          } else {
+            this.refreshWasmViews();
+            this.resetStreamingState();
+            this.startModelFade();
+          }
+        }
+      }
+    } else if (data.type === "meter") {
+      this.port.postMessage({
+        type: "meter",
+        inputRms: this.inputRms,
+        outputRms: this.outputRms,
+        sampleRate,
+        inputScope: this.scopeInput.drain(),
+        outputScope: this.scopeOutput.drain(),
+      });
+    }
+  }
+
+  clampOutputLatencyMs(value) {
+    if (!Number.isFinite(value)) return DEFAULT_OUTPUT_LATENCY_MS;
+    return Math.max(MIN_OUTPUT_LATENCY_MS, Math.min(MAX_OUTPUT_LATENCY_MS, value));
+  }
+
+  setOutputLatencyMs(value) {
+    const nextLatencyMs = this.clampOutputLatencyMs(Number(value));
+    if (nextLatencyMs === this.outputLatencyMs) return;
+    this.outputLatencyMs = nextLatencyMs;
+    this.outputLatencySamples = this.calculateOutputLatencySamples();
+    if (this.outputQueue.length < this.outputLatencySamples) {
+      this.outputPrimed = false;
+      this.outputRampRemaining = 0;
+    }
+  }
+
+  startModelFade() {
+    this.modelFadeSamples = this.calculateModelFadeSamples();
+    this.modelFadeRemaining = this.modelFadeSamples;
+    this.gains.fill(0);
+  }
+
+  refreshWasmViews() {
+    this.denoiseRate = this.exports.denoise_web_sample_rate();
+    this.hopLength = this.exports.denoise_web_hop_length();
+    this.inputBins = this.exports.denoise_web_input_bins();
+    this.gains = new Float32Array(this.inputBins);
+    this.resampleInput = new Float32Array(this.hopLength);
+
+    const memory = this.exports.memory;
+    const inputPtr = this.exports.denoise_web_input_ptr();
+    const outputPtr = this.exports.denoise_web_output_ptr();
+    const gainsPtr = this.exports.denoise_web_gains_ptr();
+    this.inputHop = new Float32Array(memory.buffer, inputPtr, this.hopLength);
+    this.outputHop = new Float32Array(memory.buffer, outputPtr, this.hopLength);
+    this.gainsView = new Float32Array(memory.buffer, gainsPtr, this.inputBins);
+    this.hopFill = 0;
+    this.dryDelaySamples = this.calculateDryDelaySamples();
+    this.dryDelayQueue = new Fifo(Math.max(16384, this.dryDelaySamples + (this.hopLength * 4)));
+    this.resetDryDelay();
+  }
+
+  resetStreamingState() {
+    this.downsampler.reset();
+    this.upsampler.reset();
+    this.scopeUpsampler.reset();
+    this.outputQueue.clear();
+    this.scopeOutputQueue.clear();
+    this.resetDryDelay();
+    this.outputPrimed = false;
+    this.outputLatencySamples = this.calculateOutputLatencySamples();
+    this.outputRampSamples = this.calculateOutputRampSamples();
+    this.outputRampRemaining = 0;
+    this.modelFadeSamples = this.calculateModelFadeSamples();
+    this.lastOutputSample = 0;
+  }
+
+  calculateDryDelaySamples() {
+    const latencyHops = this.exports.denoise_web_algorithmic_latency_hops();
+    return Math.max(0, Math.trunc(latencyHops) * this.hopLength);
+  }
+
+  resetDryDelay() {
+    this.dryDelayQueue.clear();
+    for (let i = 0; i < this.dryDelaySamples; i += 1) {
+      this.dryDelayQueue.push(0);
+    }
+  }
+
+  nextDelayedDrySample(sample) {
+    if (this.dryDelaySamples <= 0) return sample;
+    const delayed = this.dryDelayQueue.shift();
+    this.dryDelayQueue.push(sample);
+    return delayed;
+  }
+
+  appendScopeSample(target, value) {
+    target.push(value);
+  }
+
+  calculateOutputLatencySamples() {
+    return Math.max(
+      RENDER_QUANTUM_SAMPLES * 2,
+      Math.ceil(sampleRate * (this.outputLatencyMs / 1000))
+    );
+  }
+
+  calculateOutputRampSamples() {
+    return Math.max(RENDER_QUANTUM_SAMPLES, Math.ceil(sampleRate * OUTPUT_RAMP_SECONDS));
+  }
+
+  calculateModelFadeSamples() {
+    return Math.max(this.hopLength, Math.ceil(this.denoiseRate * MODEL_FADE_SECONDS));
+  }
+
+  nextModelFadeGain() {
+    if (this.modelFadeRemaining <= 0) return 1;
+    const gain = 1 - (this.modelFadeRemaining / this.modelFadeSamples);
+    this.modelFadeRemaining -= 1;
+    return Math.max(0, Math.min(1, gain));
+  }
+
+  acceptDenoiseSample(sample) {
+    if (!this.ready) return;
+    this.inputHop[this.hopFill] = sample;
+    this.hopFill += 1;
+    if (this.hopFill < this.hopLength) return;
+
+    const produced = this.exports.denoise_web_process_hop(1);
+    if (produced >= 0) {
+      this.gains.set(this.gainsView);
+      const resampleInput = this.resampleInput;
+      for (let i = 0; i < this.hopLength; i += 1) {
+        const dry = this.nextDelayedDrySample(this.inputHop[i]);
+        const processed = produced ? this.outputHop[i] : 0;
+        const modelFade = this.nextModelFadeGain();
+        resampleInput[i] = this.enabled ? dry + (processed - dry) * this.wet * modelFade : dry;
+      }
+      this.upsampler.process(resampleInput);
+    }
+    this.hopFill = 0;
+  }
+
+  nextOutputSample() {
+    if (!this.outputPrimed) {
+      if (this.outputQueue.length < this.outputLatencySamples) return 0;
+      this.outputPrimed = true;
+      this.outputRampRemaining = this.outputRampSamples;
+    }
+
+    if (this.outputQueue.length <= 0) {
+      this.outputPrimed = false;
+      this.outputRampRemaining = 0;
+      this.lastOutputSample *= 0.98;
+      return this.lastOutputSample;
+    }
+
+    let value = this.outputQueue.shift();
+    if (this.outputRampRemaining > 0) {
+      const ramp = 1 - (this.outputRampRemaining / this.outputRampSamples);
+      value *= ramp;
+      this.outputRampRemaining -= 1;
+    }
+    this.lastOutputSample = value;
+    return value;
+  }
+
+  process(inputs, outputs) {
+    const input = inputs[0]?.[0];
+    const output = outputs[0]?.[0];
+    if (!output) return true;
+
+    if (!input || !this.ready) {
+      output.fill(0);
+      return true;
+    }
+
+    let inEnergy = 0;
+    for (let i = 0; i < input.length; i += 1) {
+      const value = input[i];
+      inEnergy += value * value;
+    }
+    this.inputRms = Math.sqrt(inEnergy / input.length);
+
+    // Load: the time spent denoising against the audio time, reported every 2 s (this page's addition)
+    const t0 = hnClock();
+    this.downsampler.process(input);
+    this.busyMs = (this.busyMs || 0) + hnClock() - t0;
+    this.audioSamples = (this.audioSamples || 0) + input.length;
+    if (this.audioSamples >= sampleRate * 2) {
+      this.port.postMessage({ type: 'load', pct: Math.round(this.busyMs / (this.audioSamples / sampleRate * 1000) * 100) });
+      this.busyMs = 0;
+      this.audioSamples = 0;
+    }
+
+    let outEnergy = 0;
+    for (let i = 0; i < output.length; i += 1) {
+      const value = Math.max(-1, Math.min(1, this.nextOutputSample() * this.gain));
+      output[i] = value;
+      outEnergy += value * value;
+    }
+    this.outputRms = Math.sqrt(outEnergy / output.length);
+    return true;
+  }
+
+  nextScopeOutputSample() {
+    if (!this.outputPrimed || this.scopeOutputQueue.length <= 0) return 0;
+    return Math.max(-1, Math.min(1, this.scopeOutputQueue.shift()));
+  }
+}
+
+registerProcessor("hamnoise-denoise", DenoiseWorklet);
 </script>
 <script type="text/plain" id="cw-worker-src">
 // ---- CW decoder: the DeepCW neural Morse decoder, run in a Web Worker on the receiver audio.

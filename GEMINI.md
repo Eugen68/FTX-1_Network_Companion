@@ -36,7 +36,7 @@ the FTDX10 ACC scope (`main/acc_frame.c`). Read `README.md` before changing beha
 - Build (ESP-IDF v6.1 shell): `idf.py build`
 - Host tests (bash + gcc, e.g. Linux, WSL or the Dev Container): `bash test/<name>/run.sh` for
   `host_cat`, `host_ft8`, `host_tx`, `host_tx_ws`, `host_rigctl`, `host_yaesu_cat`,
-  `host_ui_prefs`, `host_acc`, `host_cw`. Add or extend a host test for new logic.
+  `host_ui_prefs`, `host_acc`, `host_cw`, `host_hn`. Add or extend a host test for new logic.
 - If you could not build or run the tests, say so plainly in the pull request. Do not claim a
   check you did not run.
 

@@ -36,7 +36,8 @@ _Static_assert((APP_CONFIG_OTA_USER_MAX_LEN + 1 + APP_CONFIG_OTA_PASS_MAX_LEN + 
 // The embedded pages use inline scripts and styles and Google Fonts. The FT8 and CW decoders run in
 // Web Workers created from Blob URLs (worker-src blob:). The CW decoder downloads its ONNX runtime
 // and models from cdn.jsdelivr.net (too large for the firmware), checks their SHA-256, then imports
-// the runtime from a blob: URL and compiles its WebAssembly ('wasm-unsafe-eval'). Everything else
+// the runtime from a blob: URL and compiles its WebAssembly ('wasm-unsafe-eval'). The AI noise reduction
+// (HamNoise) does the same with its WebAssembly, in an AudioWorklet added from a blob: URL. Everything else
 // (connections, frames, forms, <base>, plugins) is restricted to this device.
 #define CONTENT_SECURITY_POLICY                                                         \
     "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:; "   \
